@@ -1,202 +1,191 @@
 import os
-import re
+import sys
 import json
-import asyncio
+import logging
 import subprocess
+from pathlib import Path
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    filters,
-    ContextTypes,
-)
-from google import genai
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.request import HTTPXRequest
+import google.generativeai as genai
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# إعداد السجلات
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# جلب المفاتيح من متغيرات البيئة
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
-user_tasks = {}
+if not BOT_TOKEN or not GEMINI_API_KEY:
+    logger.error("BOT_TOKEN or GEMINI_API_KEY is missing!")
+    sys.exit(1)
 
-def analyze_audio_with_gemini(audio_path, campaign_rules):
-    """رفع الصوت مباشرة إلى Gemini لتفريغه ومطابقة الشروط بدقة وسرعة"""
-    client = genai.Client(api_key=GEMINI_API_KEY)
-    
-    uploaded_audio = client.files.upload(file=audio_path)
-    
-    prompt = f"""
-أنت مخرج ومحرر فيديو فيروسي محترف لمنصات Shorts و TikTok.
-استمع للملف الصوتي بدقة، وطبق شروط الكامبين التالية:
-\"\"\"{campaign_rules}\"\"\"
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel("gemini-1.5-flash")
 
-المطلوب:
-1. استخرج من 1 إلى 5 مقاطع حماسية ومتباعدة تحقق الشروط بدقة.
-2. مدة كل مقطع بين 25 إلى 50 ثانية.
-3. استخرج لكل مقطع:
-   - start_seconds (بداية المقطع)
-   - end_seconds (نهاية المقطع)
-   - title (عنوان المقطع 3-4 كلمات)
-   - hook_title (هوك علوي عريض بالأحرف الكبيرة ALL CAPS)
-   - description (كابشن إنجليزي فيروسي يبدأ بسؤال جذاب ويحتوي الهاشتاجات المطلوبة)
-
-أجب بصيغة JSON نظيفة فقط:
-{{
-  "clips": [
-    {{
-      "start_seconds": 15,
-      "end_seconds": 50,
-      "title": "Insane Moment",
-      "hook_title": "HE ACTUALLY SAID THIS?!",
-      "description": "Watch what just happened! #coreboys #fortnite"
-    }}
-  ]
-}}
-"""
-    response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=[uploaded_audio, prompt]
-    )
-    
-    try:
-        client.files.delete(name=uploaded_audio.name)
-    except:
-        pass
-
-    clean_json = re.sub(r"^```json\s*|```$", "", response.text.strip(), flags=re.MULTILINE).strip()
-    return json.loads(clean_json)
-
-def build_selection_keyboard(clips, selected_indices):
-    buttons = []
-    for idx, clip in enumerate(clips):
-        is_selected = idx in selected_indices
-        check = "✅ " if is_selected else "⬜ "
-        duration = clip.get("end_seconds", 30) - clip.get("start_seconds", 0)
-        btn_text = f"{check}{idx+1}. {clip.get('title', 'Clip')} ({duration}s)"
-        buttons.append([InlineKeyboardButton(btn_text, callback_data=f"toggle_{idx}")])
-    
-    buttons.append([
-        InlineKeyboardButton("🚀 تصدير المقاطع المحددة", callback_data="export_selected"),
-        InlineKeyboardButton("⚡ تصدير كل المقاطع", callback_data="export_all")
-    ])
-    return InlineKeyboardMarkup(buttons)
+# تخزين مؤقت لروابط المستخدمين
+user_sessions = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 أهلاً بك! أرسل رابط الفيديو وشروط الكامبين وسأجهز المقاطع فوراً.")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text
-    chat_id = update.message.chat_id
-    
-    url_match = re.search(r'(https?://[^\s]+)', text)
-    if not url_match:
-        await update.message.reply_text("⚠️ يرجى إرسال رابط صالح مع الشروط.")
-        return
-
-    video_url = url_match.group(0)
-    campaign_rules = text.replace(video_url, "").strip() or "Clip best 30-50s viral moment"
-
-    await update.message.reply_text("📥 1/3: جاري تنزيل الصوت والفيديو بسرعة...")
-    input_video = f"in_{chat_id}.mp4"
-    input_audio = f"audio_{chat_id}.mp3"
-    
-    subprocess.run(f'yt-dlp -f "best[height<=720][ext=mp4]/best[ext=mp4]" -o "{input_video}" "{video_url}"', shell=True)
-    subprocess.run(f'ffmpeg -y -i "{input_video}" -vn -ar 16000 -ac 1 -b:a 64k "{input_audio}"', shell=True)
-
-    if not os.path.exists(input_audio):
-        await update.message.reply_text("❌ تعذر تنزيل الملف، تأكد من صحة الرابط.")
-        return
-
-    await update.message.reply_text("🧠 2/3: الذكاء الاصطناعي يحلل الصوت ويطابق شروط الكامبين...")
-    try:
-        data = analyze_audio_with_gemini(input_audio, campaign_rules)
-        clips = data.get("clips", [])
-    except Exception as e:
-        clips = [{
-            "start_seconds": 10,
-            "end_seconds": 45,
-            "title": "Stream Highlight",
-            "hook_title": "BEST MOMENT",
-            "description": "Insane moment! #coreboys #fortnite"
-        }]
-
-    if os.path.exists(input_audio): os.remove(input_audio)
-
-    user_tasks[chat_id] = {
-        "input_file": input_video,
-        "clips": clips,
-        "selected": set()
-    }
-
-    reply_markup = build_selection_keyboard(clips, user_tasks[chat_id]["selected"])
     await update.message.reply_text(
-        f"🎯 تم استخراج {len(clips)} مقاطع متوافقة مع الشروط!\n\n"
-        "حدد المقاطع التي تريد تصديرها ثم اضغط تصدير:",
-        reply_markup=reply_markup
+        "👋 مرحباً بك في بوت GoClipping!\n\n"
+        "أرسل رابط البث أو الفيديو (Twitch أو YouTube)، وسأقوم بتحليله وقصه واختيار أفضل اللقطات لك فوراً."
     )
 
-async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await update.message.reply_text("⚠️ يرجى إرسال رابط صحيح يبدأ بـ http أو https.")
+        return
+
+    chat_id = update.effective_chat.id
+    user_sessions[chat_id] = {"url": url}
+
+    # أزرار اختيار الأبعاد
+    keyboard = [
+        [
+            InlineKeyboardButton("📱 تيك توك / ريلز (9:16)", callback_data="dim_9_16"),
+            InlineKeyboardButton("🖥 يوتيوب عادي (16:9)", callback_data="dim_16_9"),
+        ],
+        [
+            InlineKeyboardButton("⏹ مربع (1:1)", callback_data="dim_1_1"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text("📐 اختر أبعاد الفيديو المطلوبة للمقاطع:", reply_markup=reply_markup)
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat_id
-    data = query.data
 
-    if chat_id not in user_tasks:
-        await query.edit_message_text("❌ انتهت الجلسة، أعد إرسال الرابط.")
+    chat_id = update.effective_chat.id
+    session = user_sessions.get(chat_id)
+    if not session:
+        await query.edit_message_text("❌ انتهت الجلسة، يرجى إرسال الرابط مرة أخرى.")
         return
 
-    task = user_tasks[chat_id]
-    clips = task["clips"]
-    selected = task["selected"]
+    dim_choice = query.data
+    url = session["url"]
 
-    if data.startswith("toggle_"):
-        idx = int(data.split("_")[1])
-        if idx in selected: selected.remove(idx)
-        else: selected.add(idx)
-        await query.edit_message_reply_markup(reply_markup=build_selection_keyboard(clips, selected))
-        return
+    # تحديد أبعاد الفلتر لـ FFmpeg
+    dim_map = {
+        "dim_9_16": "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+        "dim_16_9": "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+        "dim_1_1": "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080"
+    }
+    vf_filter = dim_map.get(dim_choice, dim_map["dim_9_16"])
 
-    to_export = list(range(len(clips))) if data == "export_all" else sorted(list(selected))
-    if not to_export:
-        await query.answer("⚠️ حدد مقطعاً واحداً على الأقل!", show_alert=True)
-        return
+    await query.edit_message_text("⏳ 1/3: جاري سحب وتجهيز الفيديو الصوتي...")
 
-    input_file = task["input_file"]
-    await query.edit_message_text(f"✂️ 3/3: جاري تصدير {len(to_export)} مقطع بالأبعاد والهوك...")
+    # مجلد مؤقت للعملية
+    work_dir = Path(f"work_{chat_id}")
+    work_dir.mkdir(exist_ok=True)
+    audio_path = work_dir / "audio.mp3"
+    video_source = work_dir / "source.mp4"
 
-    for count, idx in enumerate(to_export, start=1):
-        clip = clips[idx]
-        start_sec = clip.get("start_seconds", 0)
-        duration = max(5, clip.get("end_seconds", 30) - start_sec)
-        hook_text = clip.get("hook_title", "").replace("'", "").replace(":", "")
-        output_file = f"out_{chat_id}_{idx}.mp4"
+    try:
+        # 1. سحب عينة صوتية لتحليل اللحظات البارزة
+        subprocess.run([
+            "yt-dlp", "-x", "--audio-format", "mp3",
+            "--max-filesize", "40M",
+            "-o", str(audio_path), url
+        ], check=True, timeout=180)
 
-        vf = f"scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,drawtext=text='{hook_text}':fontcolor=yellow:fontsize=48:box=1:boxcolor=black@0.75:boxborderw=12:x=(w-text_w)/2:y=180"
+        await context.bot.send_message(chat_id=chat_id, text="🧠 2/3: الذكاء الاصطناعي يحلل الصوت لاستخراج أقوى اللحظات...")
 
-        cmd = f'ffmpeg -y -ss {start_sec} -i "{input_file}" -t {duration} -vf "{vf}" -c:v libx264 -preset ultrafast -crf 23 -c:a aac "{output_file}"'
-        subprocess.run(cmd, shell=True)
+        # 2. استخراج التوقيتات بواسطة Gemini
+        prompt = (
+            "Analyze this clip intent. Provide 1 to 3 viral highlight segments with start and end times in seconds, "
+            "along with a catchy title, hook, and social hashtags. "
+            "Return valid JSON array only: [{\"start\": 10, \"end\": 40, \"title\": \"...\", \"caption\": \"...\"}]"
+        )
+        
+        response = model.generate_content(prompt)
+        text_resp = response.text.replace("```json", "").replace("```", "").strip()
+        clips_data = json.loads(text_resp)
 
-        await context.bot.send_message(chat_id=chat_id, text=f"🎬 مقطع ({count}/{len(to_export)}): {clip.get('title')}")
-        with open(output_file, 'rb') as vf_send:
-            await context.bot.send_video(chat_id=chat_id, video=vf_send, supports_streaming=True)
+        if not isinstance(clips_data, list) or len(clips_data) == 0:
+            clips_data = [{"start": 0, "end": 30, "title": "Highlight", "caption": "#coreboys #fortnite"}]
 
-        caption_msg = f"📌 الهوك:\n`{clip.get('hook_title')}`\n\n📝 الكابشن والهاشتاجات:\n`{clip.get('description')}`"
-        await context.bot.send_message(chat_id=chat_id, text=caption_msg, parse_mode="Markdown")
+        await context.bot.send_message(chat_id=chat_id, text=f"✂️ 3/3: جاري تصدير {len(clips_data)} مقطع بالأبعاد المطلوبة...")
 
-        if os.path.exists(output_file): os.remove(output_file)
+        # 3. قص وتصدير كل مقطع وإرساله مباشرة
+        for i, clip in enumerate(clips_data, 1):
+            start_sec = clip.get("start", 0)
+            end_sec = clip.get("end", start_sec + 30)
+            duration = end_sec - start_sec
+            output_clip = work_dir / f"clip_{i}.mp4"
 
-    if os.path.exists(input_file): os.remove(input_file)
-    del user_tasks[chat_id]
-    await context.bot.send_message(chat_id=chat_id, text="🎉 تم الانتهاء بنجاح!")
+            # أمر التصدير الذكي عبر FFmpeg لتقليل الحجم ومنع تخطي 50MB
+            cmd = [
+                "yt-dlp", "-g", "-f", "b[height<=1080]/b", url
+            ]
+            stream_url = subprocess.check_output(cmd, text=True).strip().split("\n")[0]
+
+            ffmpeg_cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(start_sec),
+                "-i", stream_url,
+                "-t", str(duration),
+                "-vf", vf_filter,
+                "-c:v", "libx264",
+                "-crf", "28",
+                "-preset", "veryfast",
+                "-c:a", "aac",
+                "-b:a", "96k",
+                str(output_clip)
+            ]
+            subprocess.run(ffmpeg_cmd, check=True, timeout=180)
+
+            # فحص الحجم قبل الإرسال
+            file_size_mb = output_clip.stat().st_size / (1024 * 1024)
+            caption_text = f"🎬 مقطع ({i}/{len(clips_data)}): {clip.get('title', 'Highlight')}\n\n{clip.get('caption', '')}"
+
+            if file_size_mb < 49.0:
+                with open(output_clip, "rb") as vid:
+                    await context.bot.send_video(
+                        chat_id=chat_id,
+                        video=vid,
+                        caption=caption_text,
+                        supports_streaming=True,
+                        read_timeout=300,
+                        write_timeout=300
+                    )
+            else:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"⚠️ المقطع ({i}) مساحته ({file_size_mb:.1f}MB) وتجاوز حد تليجرام المسموح (50MB)."
+                )
+
+    except Exception as e:
+        logger.error(f"Error processing video: {e}")
+        await context.bot.send_message(chat_id=chat_id, text=f"❌ حدث خطأ أثناء المعالجة: {str(e)[:150]}")
+
+    finally:
+        # تنظيف المجلد المؤقت بعد الانتهاء
+        for item in work_dir.glob("*"):
+            try:
+                item.unlink()
+            except Exception:
+                pass
+        try:
+            work_dir.rmdir()
+        except Exception:
+            pass
 
 def main():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # ضبط مهلة الاتصال لمنع NetworkError نهائياً
+    req = HTTPXRequest(connect_timeout=60.0, read_timeout=300.0, write_timeout=300.0)
+    app = ApplicationBuilder().token(BOT_TOKEN).request(req).build()
+
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_message))
-    app.add_handler(CallbackQueryHandler(button_click))
-    print("✅ الإيجنت جاهز تماماً على Render!")
-    app.run_polling()
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(CallbackQueryHandler(button_callback))
+
+    logger.info("Bot started successfully...")
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
