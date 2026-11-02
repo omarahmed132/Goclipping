@@ -14,8 +14,9 @@ from telegram.ext import (
 )
 from google import genai
 
-BOT_TOKEN = "8983856104:AAHKQiH1otjnIMxfJz9JOnlA2z4qKY41P8s"
-GEMINI_API_KEY = "AQ.Ab8RN6LtdgxEKpf_j0U8lu0hKQ8oJZJ3M_Yy5yM7H7MZmqlddw"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
 
 user_tasks = {}
 
