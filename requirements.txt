@@ -1,4 +1,4 @@
-python-telegram-bot==20.8
+python-telegram-bot
+google-generativeai
 yt-dlp
-ffmpeg-python
-google-genai
+httpx
