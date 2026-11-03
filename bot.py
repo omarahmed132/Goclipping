@@ -14,7 +14,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.request import HTTPXRequest
-import google.generativeai as genai
+from google import genai
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -29,9 +29,7 @@ if not BOT_TOKEN or not GEMINI_API_KEY:
     logger.error("Missing BOT_TOKEN or GEMINI_API_KEY!")
     sys.exit(1)
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
-
+client = genai.Client(api_key=GEMINI_API_KEY)
 user_sessions = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -114,18 +112,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         audio_file = work_dir / "stream_audio.mp3"
 
         try:
-            # تنزيل الصوت الفعلي لأول 20 دقيقة أو مقطع خفيف لتحليله عبر Gemini
             subprocess.run([
                 "yt-dlp", "-x", "--audio-format", "mp3",
-                "--download-sections", "*00:00-25:00",
+                "--download-sections", "*00:00-20:00",
                 "-o", str(audio_file),
                 url
             ], check=True, timeout=180)
 
             await context.bot.send_message(chat_id=chat_id, text="🧠 2/3: الذكاء الاصطناعي يستمع للمحتوى ويختار اللحظات الفايرل حسب الشروط...")
 
-            # رفع ملف الصوت إلى Gemini File API ليسمع الكلام والمشاعر بدقة
-            uploaded_audio = genai.upload_file(str(audio_file), mime_type="audio/mp3")
+            uploaded_file = client.files.upload(file=str(audio_file))
 
             prompt = (
                 f"You are a top-tier viral TikTok/Reels clipping editor.\n"
@@ -133,25 +129,28 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Find the absolute most viral, funny, shocking, or high-energy moments.\n"
                 f"Extract exactly {clip_count} segments.\n"
                 f"Each segment must be between 30 and 60 seconds long.\n"
-                f"Write an irresistible pop-up hook (max 4 words, UPPERCASE) and a compelling caption with all required hashtags.\n"
+                f"Write an irresistible hook (max 4 words, UPPERCASE) and a compelling caption with all required hashtags.\n"
                 f"Return ONLY a valid JSON array: "
                 f"[{{\"start\": 120, \"end\": 165, \"title\": \"...\", \"hook\": \"WAIT FOR IT!\", \"caption\": \"...\"}}]"
             )
 
-            response = model.generate_content([uploaded_audio, prompt])
+            response = client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[uploaded_file, prompt]
+            )
+
             clean_text = response.text.replace("```json", "").replace("```", "").strip()
             clips_data = json.loads(clean_text)
 
-            # حذف الملف الصوتي المرفوع من خوادم جوجل بعد التحليل
             try:
-                uploaded_audio.delete()
+                client.files.delete(name=uploaded_file.name)
             except Exception:
                 pass
 
             if not isinstance(clips_data, list) or len(clips_data) == 0:
                 raise ValueError("AI response format invalid")
 
-            await context.bot.send_message(chat_id=chat_id, text=f"✂️ 3/3: تم تحديد اللحظات بنجاح! جاري إنتاج {len(clips_data)} مقاطع بحجم الشاشة المثالي...")
+            await context.bot.send_message(chat_id=chat_id, text=f"✂️ 3/3: تم استخراج أفضل اللحظات! جاري إنتاج {len(clips_data)} مقاطع بحجم متناسق...")
 
             cmd = ["yt-dlp", "-g", "-f", "b[height<=1080]/b", url]
             stream_url = subprocess.check_output(cmd, text=True).strip().split("\n")[0]
@@ -164,8 +163,6 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 output_clip = work_dir / f"clip_{i}.mp4"
 
                 if dim_choice == "dim_9_16":
-                    # الفيديو الأساسي يشغل 1080 عرض بارتفاع مناسب وكبير (حوالي 65-70% من الشاشة)
-                    # مع بلور أنيق وخفيف في الخلفية ومكان بارز للهوك في الأعلى
                     vf_filter = (
                         "[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5[bg];"
                         "[0:v]scale=1080:-2[fg];"
@@ -226,7 +223,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text=f"⚠️ المقطع ({i}) مساحته ({file_size_mb:.1f}MB) وتجاوز حد الـ 50MB.",
                     )
 
-            await context.bot.send_message(chat_id=chat_id, text="🚀 تم تجهيز وإرسال المقاطع بنجاح!")
+            await context.bot.send_message(chat_id=chat_id, text="🚀 تم تجهيز وإرسال جميع المقاطع بنجاح!")
 
         except Exception as e:
             logger.error(f"Execution error: {e}")
